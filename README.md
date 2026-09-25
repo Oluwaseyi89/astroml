@@ -20,6 +20,7 @@ AstroML provides end-to-end tooling for:
 * Anomaly detection
 * Temporal modeling
 * Reproducible ML experimentation
+* Autonomous LLM agents for multi-step reasoning and task execution
 
 ---
 
@@ -113,6 +114,45 @@ Create a PostgreSQL database and update:
 ```
 config/database.yaml
 ```
+
+---
+
+## 🤖 LLM Agent Framework
+
+AstroML includes an LLM agent framework for **multi-step reasoning and autonomous task execution** over the graph pipeline. It is provider agnostic, dependency light (the core loop is standard library only) and traces every step so runs stay auditable.
+
+```bash
+# Offline smoke test with the deterministic echo provider
+python -m astroml.agent "Summarise this transaction graph"
+
+# Against a local Ollama server, with task decomposition
+python -m astroml.agent --provider ollama --model llama3.1 --plan \
+  "Rank the busiest accounts and flag anything unusual"
+
+# Analyse a graph file and print the full trace as JSON
+python -m astroml.agent --edges data/edges.json --json "How many accounts?"
+```
+
+```python
+from astroml.agent import (
+    AgentConfig,
+    AgentExecutor,
+    build_default_registry,
+    provider_from_env,
+)
+
+agent = AgentExecutor(
+    llm=provider_from_env(),           # echo | scripted | openai | ollama | ...
+    tools=build_default_registry(),    # graph_overview, window_stats, ...
+    config=AgentConfig(mode="auto", max_steps=8),
+)
+result = agent.run("Which accounts look unusual?")
+
+print(result.answer)
+print(result.trace.summary())
+```
+
+📚 **Full guide**: [docs/agent-framework.md](./docs/agent-framework.md) — providers, tools, memory, planning, CLI flags and design notes.
 
 ---
 

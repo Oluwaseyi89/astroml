@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from typing import Optional
 
 from .ingestion.service import IngestionService
@@ -9,6 +10,15 @@ from .ingestion.state import StateStore
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # ``astroml agent ...`` is implemented by the agent framework's own CLI so
+    # that the agent stays optional and its dependency surface stays small.
+    if argv and argv[0] == "agent":
+        from .agent.cli import main as agent_main
+
+        return agent_main(argv[1:])
+
     parser = argparse.ArgumentParser(prog="astroml", description="AstroML utilities CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
