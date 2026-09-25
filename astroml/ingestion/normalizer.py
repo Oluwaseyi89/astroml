@@ -1,6 +1,15 @@
-"""Transaction normalizer for extracting structured data from Horizon operations."""
+"""Transaction normalizer for extracting structured data from Horizon operations.
+
+Also usable as a CLI: ``python -m astroml.ingestion.normalizer --help``.
+"""
 
 from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections.abc import Sequence
+from typing import Any
 
 from astroml.db.schema import NormalizedTransaction
 from astroml.ingestion.parsers import (
@@ -75,3 +84,65 @@ def normalize_path_payment_hops(data: dict) -> list[NormalizedTransaction]:
         )
         for hop in hops
     ]
+
+
+# ---------------------------------------------------------------------------
+# CLI — issue #990
+# ---------------------------------------------------------------------------
+
+_CLI_DESCRIPTION = (
+    "Normalize raw Horizon operation JSON into NormalizedTransaction records. "
+    "Input is a JSON object or array of operations; output is one JSON record per line."
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the ``python -m astroml.ingestion.normalizer`` argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="python -m astroml.ingestion.normalizer",
+        description=_CLI_DESCRIPTION,
+    )
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default="-",
+        help="path to a JSON file of operations, or '-' for stdin (default: -)",
+    )
+    parser.add_argument(
+        "--hops",
+        action="store_true",
+        help="expand path payments into one record per hop",
+    )
+    return parser
+
+
+def _to_record(tx: NormalizedTransaction) -> dict[str, Any]:
+    return {
+        "transaction_hash": tx.transaction_hash,
+        "sender": tx.sender,
+        "receiver": tx.receiver,
+        "asset": tx.asset,
+        "amount": float(tx.amount) if tx.amount is not None else None,
+        "timestamp": tx.timestamp.isoformat(),
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point; returns a process exit code."""
+    args = build_parser().parse_args(argv)
+    if args.input == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(args.input) as fh:
+            raw = fh.read()
+    data = json.loads(raw)
+    ops = data if isinstance(data, list) else [data]
+    normalize = normalize_path_payment_hops if args.hops else (lambda op: [normalize_operation(op)])
+    for op in ops:
+        for tx in normalize(op):
+            print(json.dumps(_to_record(tx)))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
