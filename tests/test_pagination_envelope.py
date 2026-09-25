@@ -14,7 +14,6 @@ from pydantic import ValidationError
 
 from astroml.db.session import Page, PageParams, paginate_offset
 
-
 # ---------------------------------------------------------------------------
 # PageParams
 # ---------------------------------------------------------------------------
