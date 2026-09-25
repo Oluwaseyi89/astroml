@@ -9,6 +9,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 
 from astroml.db.schema import NormalizedTransaction
@@ -125,6 +126,38 @@ def _to_record(tx: NormalizedTransaction) -> dict[str, Any]:
         "amount": float(tx.amount) if tx.amount is not None else None,
         "timestamp": tx.timestamp.isoformat(),
     }
+
+
+_RECORD_FIELDS = ("transaction_hash", "sender", "receiver", "asset", "amount", "timestamp")
+
+
+def restore_record(record: dict[str, Any]) -> NormalizedTransaction:
+    """Restore a NormalizedTransaction from a CLI output record (issue #985).
+
+    Inverse of the JSON records printed by :func:`main`, so a normalized
+    snapshot written to disk can be reloaded without re-fetching Horizon.
+
+    Args:
+        record: One decoded JSON record as emitted by the CLI.
+
+    Returns:
+        A new, unpersisted NormalizedTransaction.
+
+    Raises:
+        ValueError: if a field is missing or the timestamp is not ISO-8601.
+    """
+    missing = [f for f in _RECORD_FIELDS if f not in record]
+    if missing:
+        raise ValueError(f"record missing fields: {missing}")
+    amount = record["amount"]
+    return NormalizedTransaction(
+        transaction_hash=record["transaction_hash"],
+        sender=record["sender"],
+        receiver=record["receiver"],
+        asset=record["asset"],
+        amount=float(amount) if amount is not None else None,
+        timestamp=datetime.fromisoformat(record["timestamp"]),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
