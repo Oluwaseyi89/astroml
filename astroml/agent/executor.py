@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
 
 from ._async import run_sync
+from .compression import CompressionStats, PromptCompressor, total_stats
 from .llm import LLMProvider, LLMResponse
 from .memory import ConversationMemory, Memory
 from .planner import ReActParser, TaskPlanner
@@ -64,19 +65,28 @@ REACT_INSTRUCTIONS = (
 )
 
 
-def format_tool_catalogue(tools: Sequence[ToolSpec]) -> str:
-    """Render tool specs as a plain text catalogue for the system prompt."""
+def format_tool_catalogue(tools: Sequence[ToolSpec], *, compact: bool = False) -> str:
+    """Render tool specs as a plain text catalogue for the system prompt.
+
+    ``compact=True`` emits one ``name(argument: type, ...): description`` line
+    per tool.  It carries exactly the same information as the default layout but
+    drops the indentation and the ``arguments:`` continuation lines, which is a
+    meaningful saving on prompts that expose a large tool set.
+    """
     if not tools:
         return "No tools are available; answer from your own knowledge."
     blocks = ["Available tools:"]
     for spec in tools:
-        blocks.append(f"- {spec.name}: {spec.description}")
         properties = (dict(spec.parameters) or {}).get("properties") or {}
-        if properties:
-            rendered = ", ".join(
-                f"{name}: {schema.get('type', 'any')}"
-                for name, schema in properties.items()
-            )
+        rendered = ", ".join(
+            f"{name}: {schema.get('type', 'any')}"
+            for name, schema in properties.items()
+        )
+        if compact:
+            blocks.append(f"- {spec.name}({rendered}): {spec.description}")
+            continue
+        blocks.append(f"- {spec.name}: {spec.description}")
+        if rendered:
             blocks.append(f"  arguments: {rendered}")
     return "\n".join(blocks)
 
@@ -109,6 +119,10 @@ class AgentExecutor:
             model (must exist in ``tools``).
         planner: Optional :class:`~astroml.agent.planner.TaskPlanner` used to
             pre-decompose the goal into steps before execution.
+        compressor: Optional
+            :class:`~astroml.agent.compression.PromptCompressor` applied to the
+            prompt of every model call.  Memory and traces keep the full
+            conversation; only what is sent to the provider is compressed.
     """
 
     def __init__(
@@ -122,6 +136,7 @@ class AgentExecutor:
         on_step: Optional[Callable[[AgentStep], None]] = None,
         tool_names: Optional[Sequence[str]] = None,
         planner: Optional[TaskPlanner] = None,
+        compressor: Optional[PromptCompressor] = None,
     ) -> None:
         self.llm = llm
         registry = tools if tools is not None else ToolRegistry()
@@ -133,6 +148,7 @@ class AgentExecutor:
         )
         self.on_step = on_step
         self.planner = planner
+        self.compressor = compressor
 
     @property
     def tool_specs(self) -> List[ToolSpec]:
@@ -144,7 +160,12 @@ class AgentExecutor:
         """System message describing the agent's contract and its tools."""
         parts = [self.system_prompt]
         if self.config.include_tool_specs_in_prompt:
-            parts.append(format_tool_catalogue(self.tools.specs()))
+            parts.append(
+                format_tool_catalogue(
+                    self.tools.specs(),
+                    compact=self.config.compact_tool_catalogue,
+                )
+            )
         if self.config.mode in ("auto", "react"):
             parts.append(REACT_INSTRUCTIONS)
         return Message.system("\n\n".join(parts))
@@ -221,13 +242,27 @@ class AgentExecutor:
         self.memory.extend([self.build_system_message(), Message.user(user_content)])
 
         tool_errors = 0
+        compression: List[CompressionStats] = []
 
         for step_index in range(self.config.max_steps):
             step = AgentStep(index=step_index, status=StepStatus.RUNNING)
 
+            prompt_messages = self.memory.messages()
+            if self.compressor is not None:
+                try:
+                    compressed = self.compressor.compress(prompt_messages)
+                except Exception as exc:  # noqa: BLE001 - compression is best effort
+                    logger.warning(
+                        "Prompt compression failed; sending the full prompt: %s", exc
+                    )
+                else:
+                    prompt_messages = compressed.messages
+                    compression.append(compressed.stats)
+                    step.metadata["compression"] = compressed.stats.to_dict()
+
             try:
                 response = await self.llm.complete(
-                    self.memory.messages(),
+                    prompt_messages,
                     tools=self.tools.specs(),
                     temperature=self.config.temperature,
                     max_tokens=self.config.max_tokens,
@@ -306,6 +341,14 @@ class AgentExecutor:
                 f"Stopped after max_steps={self.config.max_steps} "
                 "without a final answer"
             )
+
+        if compression:
+            totals = total_stats(compression)
+            trace.metadata["compression"] = {
+                **totals.to_dict(),
+                "turns": len(compression),
+                "enabled": True,
+            }
 
         trace.finished_at = time.time()
         return AgentRunResult(trace=trace, answer=trace.final_answer)

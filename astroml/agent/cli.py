@@ -26,12 +26,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import domain_tools
+from .compression import CompressionConfig, PromptCompressor
 from .domain_tools import build_default_registry
 from .executor import AgentExecutor
 from .llm import LLMProvider, provider_from_env
 from .planner import TaskPlanner
 from .tools import Tool, ToolError, ToolRegistry, tool_from_callable
-from .types import AgentConfig, AgentStep
+from .types import AgentConfig, AgentRunResult, AgentStep
 
 PROVIDER_CHOICES = (
     "echo",
@@ -109,6 +110,44 @@ def _build_parser() -> argparse.ArgumentParser:
         "--quiet",
         action="store_true",
         help="Suppress per-step progress and the trace summary",
+    )
+    compression = parser.add_argument_group("prompt compression")
+    compression.add_argument(
+        "--compress",
+        action="store_true",
+        help=(
+            "Compress the prompt sent to the model each turn (whitespace, tool "
+            "output, duplicate observations, digest of old turns)"
+        ),
+    )
+    compression.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Token budget per model call; trimming is applied until the prompt "
+            "fits. Implies --compress."
+        ),
+    )
+    compression.add_argument(
+        "--compress-keep-recent",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Most recent turns pinned by compression (default: 6). Implies --compress.",
+    )
+    compression.add_argument(
+        "--tool-output-limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Token ceiling per tool observation (default: 800). Implies --compress.",
+    )
+    compression.add_argument(
+        "--compact-tools",
+        action="store_true",
+        help="Render the tool catalogue one line per tool to save prompt tokens",
     )
     return parser
 
@@ -238,6 +277,52 @@ def _print_step(step: AgentStep) -> None:
         sys.stderr.write(f"  <- {marker}: {_short(result.content)}\n")
 
 
+def _build_compressor(args: argparse.Namespace) -> Optional[PromptCompressor]:
+    """Build the CLI's compressor, or ``None`` when compression is disabled.
+
+    Every budget flag implies ``--compress``, so ``--max-prompt-tokens 4000``
+    on its own does what it says.  Unspecified tunables fall back to the
+    :class:`CompressionConfig` defaults.
+    """
+    enabled = (
+        args.compress
+        or args.max_prompt_tokens is not None
+        or args.compress_keep_recent is not None
+        or args.tool_output_limit is not None
+    )
+    if not enabled:
+        return None
+
+    overrides: Dict[str, Any] = {}
+    if args.max_prompt_tokens is not None:
+        overrides["max_prompt_tokens"] = args.max_prompt_tokens
+    if args.compress_keep_recent is not None:
+        overrides["keep_recent"] = args.compress_keep_recent
+    if args.tool_output_limit is not None:
+        overrides["tool_output_limit"] = args.tool_output_limit
+    return PromptCompressor(config=CompressionConfig(**overrides))
+
+
+def _print_compression(result: AgentRunResult) -> None:
+    """Write the run's aggregate prompt-compression summary to stderr."""
+    data = result.trace.metadata.get("compression") or {}
+    if not data:
+        return
+    before = int(data.get("before_tokens", 0))
+    after = int(data.get("after_tokens", 0))
+    saved = max(0, before - after)
+    ratio = (saved / before) if before else 0.0
+    print(
+        f"compression: {before} -> {after} prompt tokens (-{ratio:.1%}) "
+        f"over {int(data.get('turns', 0))} turn(s)",
+        file=sys.stderr,
+    )
+    print(
+        f"  strategies: {', '.join(data.get('strategies', [])) or 'none'}",
+        file=sys.stderr,
+    )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Entry point for ``astroml agent`` and ``python -m astroml.agent``."""
     parser = _build_parser()
@@ -257,6 +342,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_steps=args.max_steps,
             max_tool_errors=args.max_tool_errors,
             mode=args.mode,
+            compact_tool_catalogue=args.compact_tools,
         )
 
         if args.edges:
@@ -277,6 +363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 else None
             ),
             on_step=None if args.quiet else _print_step,
+            compressor=_build_compressor(args),
         )
         result = agent.run(goal)
     except (KeyError, OSError, RuntimeError, ToolError, ValueError) as exc:
@@ -290,6 +377,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.quiet:
             print("-" * 60, file=sys.stderr)
             print(result.trace.summary(), file=sys.stderr)
+            _print_compression(result)
 
     return 0 if result.success else 1
 

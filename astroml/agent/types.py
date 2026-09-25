@@ -434,6 +434,9 @@ class AgentConfig:
     #: Append a rendered tool catalogue to the system prompt (needed by
     #: models that do not support native tool calling).
     include_tool_specs_in_prompt: bool = True
+    #: Render that catalogue one line per tool instead of one block per tool.
+    #: Same information, fewer prompt tokens.
+    compact_tool_catalogue: bool = False
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:

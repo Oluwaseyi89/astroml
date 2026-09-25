@@ -22,6 +22,27 @@ memory.  Quick start::
 uses OpenAI style function calling; ``mode="auto"`` supports both.  See
 ``docs/agent-framework.md`` for the full guide.
 """
+from .compression import (
+    CompressedPrompt,
+    CompressionConfig,
+    CompressionStats,
+    Compressor,
+    DEFAULT_STRATEGIES,
+    MessageGroup,
+    ObservationDedupe,
+    PromptCompressor,
+    ToolOutputCompressor,
+    WhitespaceNormalizer,
+    compress_text,
+    estimate_message_tokens,
+    estimate_messages_tokens,
+    estimate_tokens,
+    extractive_summary,
+    group_messages,
+    normalize_whitespace,
+    total_stats,
+    truncate_text,
+)
 from .executor import DEFAULT_SYSTEM_PROMPT, AgentExecutor, format_tool_catalogue
 from .llm import (
     CallableLLM,
@@ -108,6 +129,26 @@ __all__ = [
     "ReActParser",
     "TaskPlanner",
     "extract_json_block",
+    # prompt compression
+    "CompressedPrompt",
+    "CompressionConfig",
+    "CompressionStats",
+    "Compressor",
+    "DEFAULT_STRATEGIES",
+    "MessageGroup",
+    "ObservationDedupe",
+    "PromptCompressor",
+    "ToolOutputCompressor",
+    "WhitespaceNormalizer",
+    "compress_text",
+    "estimate_message_tokens",
+    "estimate_messages_tokens",
+    "estimate_tokens",
+    "extractive_summary",
+    "group_messages",
+    "normalize_whitespace",
+    "total_stats",
+    "truncate_text",
     # domain tools
     "DOMAIN_TOOLS",
     "anomaly_score_tool",
