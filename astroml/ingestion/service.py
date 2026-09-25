@@ -238,16 +238,15 @@ class IngestionService(Ingestor):
                             payload = fetch(ledger_id)
                             process(ledger_id, payload)
                         except Exception as exc:
-                            batch_metrics.observe(LedgerOutcome(ledger_id=ledger_id, status="error"))
+                            batch_metrics.observe(
+                                LedgerOutcome(ledger_id=ledger_id, status="error")
+                            )
                             batch_metrics.finish()
                             logger.error("Ingestion error for ledger %d: %s", ledger_id, exc)
                             raise
-                        processed_set.add(ledger_id)
-                        state.last_processed_ledger = (
-                            ledger_id
-                            if state.last_processed_ledger is None
-                            else max(state.last_processed_ledger, ledger_id)
-                        )
+                        # Also stamps ``state.last_processed_at`` — the heartbeat
+                        # the ingestion staleness probe reads.
+                        state.record_processed(ledger_id)
                         pending_flush += 1
                         if pending_flush >= batch_size:
                             self.state.save(state)
