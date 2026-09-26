@@ -24,6 +24,7 @@ from typing import Any, Dict, Literal, Optional
 
 from astroml.core.abstracts import IngestionResult as BaseIngestionResult
 from astroml.core.abstracts import Ingestor
+from astroml.utils.logging import CorrelationId, get_correlation_id
 from astroml.utils.validators import validate_positive_int, validate_range
 
 from .batch_metrics import BatchMetricsRecorder
@@ -220,7 +221,36 @@ class IngestionService(Ingestor):
         ledger) already covers this. The final partial batch is always
         flushed before the generator returns or is closed early (e.g. the
         caller stops iterating partway through), via a ``finally`` block.
+
+        Tracing/correlation (issues #944, #950): every log line emitted while
+        this generator runs — including from ``fetch_fn``/``process_fn`` if
+        they log through the standard logging module — carries a
+        ``request_id`` field (see :mod:`astroml.utils.logging`), so a single
+        ingestion run can be correlated end-to-end in structured logs. If the
+        caller already established a correlation id (e.g. an HTTP handler or
+        an outer ``ingest_backfill_chunked`` chunk loop), it's inherited
+        as-is; otherwise a fresh one is generated for this run and scoped to
+        the lifetime of the generator via :class:`~astroml.utils.logging.CorrelationId`.
         """
+        inherited_correlation_id = get_correlation_id()
+        with CorrelationId(inherited_correlation_id):
+            yield from self._ingest_stream_impl(
+                start_ledger=start_ledger,
+                end_ledger=end_ledger,
+                fetch_fn=fetch_fn,
+                process_fn=process_fn,
+                batch_size=batch_size,
+            )
+
+    def _ingest_stream_impl(
+        self,
+        start_ledger: int | None,
+        end_ledger: int | None,
+        fetch_fn: Callable[[int], object] | None,
+        process_fn: Callable[[int, object], None] | None,
+        batch_size: int,
+    ) -> Iterator[tuple[int, LedgerOutcome]]:
+        """Body of :meth:`ingest_stream`, run inside its correlation-id scope."""
 
         state = self.state.load()
         processed_set = state.processed_ledgers
@@ -249,6 +279,13 @@ class IngestionService(Ingestor):
 
         from astroml.observability.metrics import track_active_job
 
+        logger.info(
+            "ingest_stream starting: ledgers %d..%d (request_id=%s)",
+            start_ledger,
+            end_ledger,
+            get_correlation_id(),
+        )
+
         pending_flush = 0
         batch_metrics = BatchMetricsRecorder()
         batch_metrics.start()
@@ -265,16 +302,15 @@ class IngestionService(Ingestor):
                             payload = fetch(ledger_id)
                             process(ledger_id, payload)
                         except Exception as exc:
-                            batch_metrics.observe(LedgerOutcome(ledger_id=ledger_id, status="error"))
+                            batch_metrics.observe(
+                                LedgerOutcome(ledger_id=ledger_id, status="error")
+                            )
                             batch_metrics.finish()
                             logger.error("Ingestion error for ledger %d: %s", ledger_id, exc)
                             raise
-                        processed_set.add(ledger_id)
-                        state.last_processed_ledger = (
-                            ledger_id
-                            if state.last_processed_ledger is None
-                            else max(state.last_processed_ledger, ledger_id)
-                        )
+                        # Also stamps ``state.last_processed_at`` — the heartbeat
+                        # the ingestion staleness probe reads.
+                        state.record_processed(ledger_id)
                         pending_flush += 1
                         if pending_flush >= batch_size:
                             self.state.save(state)
