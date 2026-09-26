@@ -242,20 +242,25 @@ class SnapshotWindow:
 
 
 def _parse_window_size(window: str) -> timedelta:
-    """Parse a window size string like '7d', '24h', '3600s' into a timedelta."""
-    if not window:
-        raise _malformed_window_spec_error(window)
+    """Parse a window size string like '7d', '24h', '3600s' into a timedelta.
 
+    Raises:
+        ValueError: if the string is empty/malformed or the size is not
+            positive. Issue #991 — a zero or negative size made the snapshot
+            iterators loop forever (``window_start += step`` never advanced).
+    """
+    if not isinstance(window, str) or len(window.strip()) < 2:
+        raise ValueError(f"Invalid window size {window!r}. Use e.g. '7d', '24h', '3600s'.")
+    window = window.strip()
     unit = window[-1].lower()
     try:
         value = int(window[:-1])
     except ValueError:
-        # #949 — a numeric prefix that fails to parse (e.g. "bad", whose
-        # trailing 'd' looks like a valid unit) previously escaped as a bare,
-        # unstructured `ValueError` from `int()` instead of going through
-        # the RFC 7807 problem-detail path below.
-        raise _malformed_window_spec_error(window) from None
-
+        raise ValueError(
+            f"Invalid window size {window!r}. Use e.g. '7d', '24h', '3600s'."
+        ) from None
+    if value <= 0:
+        raise ValueError(f"Window size must be positive, got {window!r}.")
     if unit == "d":
         return timedelta(days=value)
     if unit == "h":

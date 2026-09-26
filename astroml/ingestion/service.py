@@ -77,14 +77,22 @@ class IngestionService(Ingestor):
     and implementation swapping (issue #573).
     """
 
-    def __init__(self, state_store: Optional[StateStore] = None) -> None:
+    def __init__(
+        self,
+        state_store: Optional[StateStore] = None,
+        notifier: Optional[Callable[[str], Any]] = None,
+    ) -> None:
         """Initialize the ingestion service.
 
         Args:
             state_store: Optional state store for tracking processed ledgers.
                         Defaults to a new StateStore instance.
+            notifier: Optional ``(message) -> Any`` callback invoked when
+                :meth:`ingest` fails, e.g.
+                ``SlackIntegration(config).send_webhook`` (issue #986).
         """
         self.state = state_store or StateStore()
+        self.notifier = notifier
 
     def ingest(
         self,
@@ -138,6 +146,7 @@ class IngestionService(Ingestor):
         except Exception as e:
             errors.append(str(e))
             logger.error(f"Ingestion error: {e}")
+            self._notify_failure(e, attempted, processed)
 
         end_time = datetime.utcnow()
 
@@ -149,6 +158,24 @@ class IngestionService(Ingestor):
             end_time=end_time,
             errors=errors,
         )
+
+    def _notify_failure(self, error: Exception, attempted: list[int], processed: list[int]) -> None:
+        """Send an ingestion-failure alert via ``self.notifier`` (issue #986).
+
+        Notifier errors are logged and swallowed so alerting can never mask
+        the original ingestion failure.
+        """
+        if self.notifier is None:
+            return
+        last = attempted[-1] if attempted else None
+        message = (
+            f":rotating_light: AstroML ingestion failed after ledger {last}: {error} "
+            f"({len(processed)} processed before failure)"
+        )
+        try:
+            self.notifier(message)
+        except Exception:
+            logger.warning("Ingestion failure notifier raised", exc_info=True)
 
     @validate_positive_int("batch_size")
     @validate_range("batch_size", start=1)
