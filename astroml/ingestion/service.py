@@ -24,6 +24,7 @@ from typing import Any, Dict, Literal, Optional
 
 from astroml.core.abstracts import IngestionResult as BaseIngestionResult
 from astroml.core.abstracts import Ingestor
+from astroml.utils.logging import CorrelationId, get_correlation_id
 from astroml.utils.validators import validate_positive_int, validate_range
 
 from .batch_metrics import BatchMetricsRecorder
@@ -76,14 +77,22 @@ class IngestionService(Ingestor):
     and implementation swapping (issue #573).
     """
 
-    def __init__(self, state_store: Optional[StateStore] = None) -> None:
+    def __init__(
+        self,
+        state_store: Optional[StateStore] = None,
+        notifier: Optional[Callable[[str], Any]] = None,
+    ) -> None:
         """Initialize the ingestion service.
 
         Args:
             state_store: Optional state store for tracking processed ledgers.
                         Defaults to a new StateStore instance.
+            notifier: Optional ``(message) -> Any`` callback invoked when
+                :meth:`ingest` fails, e.g.
+                ``SlackIntegration(config).send_webhook`` (issue #986).
         """
         self.state = state_store or StateStore()
+        self.notifier = notifier
 
     def ingest(
         self,
@@ -139,6 +148,7 @@ class IngestionService(Ingestor):
         except Exception as e:
             errors.append(str(e))
             logger.error(f"Ingestion error: {e}")
+            self._notify_failure(e, attempted, processed)
 
         end_time = datetime.utcnow()
 
@@ -150,6 +160,24 @@ class IngestionService(Ingestor):
             end_time=end_time,
             errors=errors,
         )
+
+    def _notify_failure(self, error: Exception, attempted: list[int], processed: list[int]) -> None:
+        """Send an ingestion-failure alert via ``self.notifier`` (issue #986).
+
+        Notifier errors are logged and swallowed so alerting can never mask
+        the original ingestion failure.
+        """
+        if self.notifier is None:
+            return
+        last = attempted[-1] if attempted else None
+        message = (
+            f":rotating_light: AstroML ingestion failed after ledger {last}: {error} "
+            f"({len(processed)} processed before failure)"
+        )
+        try:
+            self.notifier(message)
+        except Exception:
+            logger.warning("Ingestion failure notifier raised", exc_info=True)
 
     @validate_positive_int("batch_size")
     @validate_range("batch_size", start=1)
@@ -196,17 +224,35 @@ class IngestionService(Ingestor):
         flushed before the generator returns or is closed early (e.g. the
         caller stops iterating partway through), via a ``finally`` block.
 
-        Args:
-            start_ledger: Starting ledger id (inclusive). If None, resume from
-                last_processed_ledger+1 or 0.
-            end_ledger: Ending ledger id (inclusive).
-            fetch_fn: Function to fetch data for a ledger id; defaults to identity payload.
-            process_fn: Function to handle processing; defaults to no-op.
-            batch_size: Progress-log and state-flush cadence (>= 1).
-
-        Yields:
-            ``(ledger_id, LedgerOutcome)`` for each ledger in the range.
+        Tracing/correlation (issues #944, #950): every log line emitted while
+        this generator runs — including from ``fetch_fn``/``process_fn`` if
+        they log through the standard logging module — carries a
+        ``request_id`` field (see :mod:`astroml.utils.logging`), so a single
+        ingestion run can be correlated end-to-end in structured logs. If the
+        caller already established a correlation id (e.g. an HTTP handler or
+        an outer ``ingest_backfill_chunked`` chunk loop), it's inherited
+        as-is; otherwise a fresh one is generated for this run and scoped to
+        the lifetime of the generator via :class:`~astroml.utils.logging.CorrelationId`.
         """
+        inherited_correlation_id = get_correlation_id()
+        with CorrelationId(inherited_correlation_id):
+            yield from self._ingest_stream_impl(
+                start_ledger=start_ledger,
+                end_ledger=end_ledger,
+                fetch_fn=fetch_fn,
+                process_fn=process_fn,
+                batch_size=batch_size,
+            )
+
+    def _ingest_stream_impl(
+        self,
+        start_ledger: int | None,
+        end_ledger: int | None,
+        fetch_fn: Callable[[int], object] | None,
+        process_fn: Callable[[int, object], None] | None,
+        batch_size: int,
+    ) -> Iterator[tuple[int, LedgerOutcome]]:
+        """Body of :meth:`ingest_stream`, run inside its correlation-id scope."""
 
         state = self.state.load()
         processed_set = state.processed_ledgers
@@ -235,6 +281,13 @@ class IngestionService(Ingestor):
 
         from astroml.observability.metrics import track_active_job
 
+        logger.info(
+            "ingest_stream starting: ledgers %d..%d (request_id=%s)",
+            start_ledger,
+            end_ledger,
+            get_correlation_id(),
+        )
+
         pending_flush = 0
         batch_metrics = BatchMetricsRecorder()
         batch_metrics.start()
@@ -251,16 +304,15 @@ class IngestionService(Ingestor):
                             payload = fetch(ledger_id)
                             process(ledger_id, payload)
                         except Exception as exc:
-                            batch_metrics.observe(LedgerOutcome(ledger_id=ledger_id, status="error"))
+                            batch_metrics.observe(
+                                LedgerOutcome(ledger_id=ledger_id, status="error")
+                            )
                             batch_metrics.finish()
                             logger.error("Ingestion error for ledger %d: %s", ledger_id, exc)
                             raise
-                        processed_set.add(ledger_id)
-                        state.last_processed_ledger = (
-                            ledger_id
-                            if state.last_processed_ledger is None
-                            else max(state.last_processed_ledger, ledger_id)
-                        )
+                        # Also stamps ``state.last_processed_at`` — the heartbeat
+                        # the ingestion staleness probe reads.
+                        state.record_processed(ledger_id)
                         pending_flush += 1
                         if pending_flush >= batch_size:
                             self.state.save(state)

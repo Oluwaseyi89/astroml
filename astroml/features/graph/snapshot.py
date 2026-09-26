@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import bisect
 import logging
+import uuid
 from collections.abc import Generator, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -16,6 +17,118 @@ logger = logging.getLogger(__name__)
 # fetches rows from the DB in batches of this many; the iterator yields each
 # edge individually so callers never see a fully-materialised window list.
 DEFAULT_STREAM_CHUNK_SIZE = 5_000
+
+# RFC 7807 (application/problem+json) "type" base for this module's problems
+# — issue #949. These raise sites previously raised bare ``ValueError``s
+# with only a free-text message, so a caller that surfaced the error at an
+# API boundary had nothing structured to render as a problem-details
+# response. See :class:`SnapshotWindowError`.
+_PROBLEM_TYPE_BASE = "https://astroml.dev/problems/graph-snapshot"
+
+
+@dataclass(frozen=True)
+class ProblemDetail:
+    """RFC 7807 ``application/problem+json`` payload (issue #949).
+
+    Field names and semantics follow RFC 7807 §3.1:
+
+    - ``type``: a URI identifying the problem type (not necessarily
+      dereferenceable); stable per distinct failure kind so clients can
+      branch on it without parsing ``detail``.
+    - ``title``: short, human-readable summary, constant per ``type``.
+    - ``status``: the HTTP status code an API layer should map this to.
+    - ``detail``: human-readable explanation specific to this occurrence.
+    - ``instance``: a URI identifying this specific occurrence; defaults to
+      a freshly generated URN so repeated failures are distinguishable in
+      logs even without a request URL to anchor to.
+    """
+
+    type: str
+    title: str
+    status: int
+    detail: str
+    instance: str = field(default_factory=lambda: f"urn:uuid:{uuid.uuid4()}")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return the RFC 7807 member set as a plain dict, ready to serialize
+        as ``application/problem+json``."""
+        return {
+            "type": self.type,
+            "title": self.title,
+            "status": self.status,
+            "detail": self.detail,
+            "instance": self.instance,
+        }
+
+
+class SnapshotWindowError(ValueError):
+    """A graph-snapshot windowing error with an attached RFC 7807 problem detail.
+
+    Subclasses :class:`ValueError` so existing ``except ValueError`` call
+    sites (and bare ``except Exception``) keep working unchanged; the
+    difference is ``problem`` now carries structured, machine-readable
+    detail an API boundary can render as ``application/problem+json``
+    instead of only a free-text ``str(exc)``.
+    """
+
+    def __init__(self, problem: ProblemDetail) -> None:
+        super().__init__(problem.detail)
+        self.problem = problem
+
+    def to_problem_detail(self) -> dict[str, Any]:
+        """Convenience accessor for ``self.problem.to_dict()``."""
+        return self.problem.to_dict()
+
+
+def _invalid_window_bounds_error(start_ts: int, end_ts: int) -> SnapshotWindowError:
+    return SnapshotWindowError(
+        ProblemDetail(
+            type=f"{_PROBLEM_TYPE_BASE}/invalid-window-bounds",
+            title="Invalid snapshot window bounds",
+            status=400,
+            detail=f"start_ts must be <= end_ts (got start_ts={start_ts}, end_ts={end_ts})",
+        )
+    )
+
+
+def _invalid_day_count_error(days: int) -> SnapshotWindowError:
+    return SnapshotWindowError(
+        ProblemDetail(
+            type=f"{_PROBLEM_TYPE_BASE}/invalid-day-count",
+            title="Invalid snapshot day count",
+            status=400,
+            detail=f"days must be >= 1 (got days={days})",
+        )
+    )
+
+
+def _unknown_window_unit_error(window: str, unit: str) -> SnapshotWindowError:
+    return SnapshotWindowError(
+        ProblemDetail(
+            type=f"{_PROBLEM_TYPE_BASE}/unknown-window-unit",
+            title="Unknown window size unit",
+            status=400,
+            detail=(
+                f"Unknown window unit '{unit}' in window spec '{window}'. "
+                "Use 'd' (days), 'h' (hours), or 's' (seconds)."
+            ),
+        )
+    )
+
+
+def _malformed_window_spec_error(window: str) -> SnapshotWindowError:
+    return SnapshotWindowError(
+        ProblemDetail(
+            type=f"{_PROBLEM_TYPE_BASE}/malformed-window-spec",
+            title="Malformed window size specification",
+            status=400,
+            detail=(
+                f"Could not parse window spec '{window}'. Expected a numeric "
+                "value followed by 'd' (days), 'h' (hours), or 's' (seconds), "
+                "e.g. '7d', '24h', '3600s'."
+            ),
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -54,7 +167,7 @@ def window_snapshot(
       Uses binary search to find left/right indices and then slices, O(log N + K).
     """
     if start_ts > end_ts:
-        raise ValueError("start_ts must be <= end_ts")
+        raise _invalid_window_bounds_error(start_ts, end_ts)
 
     # Issue #546 — skip the defensive copy when the caller already handed us
     # a list; `list(edges)` on an already-materialised list still allocates
@@ -104,7 +217,7 @@ def snapshot_last_n_days(
     Example: days=1 -> [now_ts-86400, now_ts].
     """
     if days <= 0:
-        raise ValueError("days must be >= 1")
+        raise _invalid_day_count_error(days)
     seconds = days * 86400
     start_ts = now_ts - seconds
     if start_ts < 0:
@@ -129,16 +242,32 @@ class SnapshotWindow:
 
 
 def _parse_window_size(window: str) -> timedelta:
-    """Parse a window size string like '7d', '24h', '3600s' into a timedelta."""
+    """Parse a window size string like '7d', '24h', '3600s' into a timedelta.
+
+    Raises:
+        ValueError: if the string is empty/malformed or the size is not
+            positive. Issue #991 — a zero or negative size made the snapshot
+            iterators loop forever (``window_start += step`` never advanced).
+    """
+    if not isinstance(window, str) or len(window.strip()) < 2:
+        raise ValueError(f"Invalid window size {window!r}. Use e.g. '7d', '24h', '3600s'.")
+    window = window.strip()
     unit = window[-1].lower()
-    value = int(window[:-1])
+    try:
+        value = int(window[:-1])
+    except ValueError:
+        raise ValueError(
+            f"Invalid window size {window!r}. Use e.g. '7d', '24h', '3600s'."
+        ) from None
+    if value <= 0:
+        raise ValueError(f"Window size must be positive, got {window!r}.")
     if unit == "d":
         return timedelta(days=value)
     if unit == "h":
         return timedelta(hours=value)
     if unit == "s":
         return timedelta(seconds=value)
-    raise ValueError(f"Unknown window unit '{unit}'. Use 'd', 'h', or 's'.")
+    raise _unknown_window_unit_error(window, unit)
 
 
 @dataclass(frozen=True)
